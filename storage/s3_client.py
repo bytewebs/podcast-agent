@@ -19,11 +19,12 @@ class S3Client:
     def upload_file(self, file_path: str, s3_key: str) -> str:
         """Upload file to S3"""
         try:
+            # Remove ACL parameter to avoid AccessControlListNotSupported error
             self.s3.upload_file(
                 file_path, 
                 self.bucket, 
-                s3_key,
-                ExtraArgs={'ACL': 'public-read'}
+                s3_key
+                # Removed: ExtraArgs={'ACL': 'public-read'}
             )
             
             url = f"https://{self.bucket}.s3.{config.S3_REGION}.amazonaws.com/{s3_key}"
@@ -31,26 +32,28 @@ class S3Client:
             return url
             
         except ClientError as e:
-            logger.error(f"S3 upload failed: {str(e)}")
-            raise
+            logger.error(f"Failed to upload {file_path} to {self.bucket}/{s3_key}: {str(e)}")
+            raise Exception(f"Failed to upload {file_path} to {self.bucket}/{s3_key}: {str(e)}")
     
     def upload_content(self, content: bytes, s3_key: str, content_type: str = 'text/plain') -> str:
         """Upload content directly to S3"""
         try:
+            # Remove ACL parameter to avoid AccessControlListNotSupported error
             self.s3.put_object(
                 Bucket=self.bucket,
                 Key=s3_key,
                 Body=content,
-                ContentType=content_type,
-                ACL='public-read'
+                ContentType=content_type
+                # Removed: ACL='public-read'
             )
             
             url = f"https://{self.bucket}.s3.{config.S3_REGION}.amazonaws.com/{s3_key}"
+            logger.info(f"Content uploaded to {url}")
             return url
             
         except ClientError as e:
             logger.error(f"S3 content upload failed: {str(e)}")
-            raise
+            raise Exception(f"S3 content upload failed: {str(e)}")
     
     def upload_json(self, data: dict, s3_key: str) -> str:
         """Upload JSON data to S3"""
@@ -65,7 +68,7 @@ class S3Client:
             
         except ClientError as e:
             logger.error(f"S3 download failed: {str(e)}")
-            raise
+            raise Exception(f"S3 download failed: {str(e)}")
     
     def file_exists(self, s3_key: str) -> bool:
         """Check if file exists in S3"""

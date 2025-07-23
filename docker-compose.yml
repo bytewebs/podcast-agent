@@ -89,7 +89,7 @@ services:
       - ./:/app
       - api_logs:/app/logs
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      test: ["CMD", "python", "-c", "import requests; print(requests.get('http://localhost:5000/health').status_code)"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -342,6 +342,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    env_file:
+      - .env
     environment:
       - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql+psycopg2://podcast_user:podcast_pass@postgres:5432/podcast_db
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
@@ -370,6 +372,8 @@ services:
       dockerfile: airflow.Dockerfile
     depends_on:
       - airflow-webserver
+    env_file:
+      - .env
     environment:
       - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql+psycopg2://podcast_user:podcast_pass@postgres:5432/podcast_db
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor

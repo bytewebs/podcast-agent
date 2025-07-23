@@ -89,8 +89,9 @@ COPY requirements.txt .
 # Install dependencies and cache pip packages in a single RUN command
 RUN pip install --upgrade pip && \
     pip install --prefer-binary -r requirements.txt && \
-    pip install langchain langchain_openai
-
+    pip install langchain langchain_openai && \
+    pip install pydub && \
+    apt-get update && apt-get install -y curl
 # Copy the rest of the application (after installing dependencies)
 COPY . .
 
