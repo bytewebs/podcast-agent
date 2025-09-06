@@ -1,0 +1,35 @@
+FROM prefecthq/prefect:2.14-python3.9
+
+WORKDIR /app
+
+# Install system dependencies as root
+USER root
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    ffmpeg \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements file
+COPY requirements.prefect.txt .
+
+# Install Python dependencies as root to avoid permission issues
+RUN pip install --no-cache-dir -r requirements.prefect.txt
+
+# Copy application code
+COPY . .
+
+# Create a non-root user for runtime (simpler approach)
+RUN groupadd -r appuser && useradd -r -g appuser -m -s /bin/bash appuser && \
+    chown -R appuser:appuser /app
+
+# Switch to non-root user for runtime
+USER appuser
+
+# Set environment variables
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+
+# Default command
+CMD ["prefect", "worker", "start", "--pool", "default-agent-pool"]

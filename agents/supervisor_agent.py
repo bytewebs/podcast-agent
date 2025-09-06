@@ -1,34 +1,41 @@
 from agents.base_agent import BaseAgent
 from messaging.topics import KafkaTopics
 from database.models import JobStatus
-import requests
-import os
-import time
 from datetime import datetime, timezone
+import logging
+import os
+import requests
+import json
+import traceback
+
+logger = logging.getLogger(__name__)
 
 class SupervisorAgent(BaseAgent):
-    """Supervisor agent that orchestrates the entire workflow"""
-    
     def __init__(self):
         super().__init__("supervisor")
         
-        # Read environment variables with defaults
-        self.airflow_enabled = os.getenv('AIRFLOW_ENABLED', 'false').lower() == 'true'
-        self.airflow_base_url = os.getenv('AIRFLOW_BASE_URL', 'http://airflow-webserver:8080')
-        self.airflow_username = os.getenv('AIRFLOW_USERNAME', 'admin')
-        self.airflow_password = os.getenv('AIRFLOW_PASSWORD', 'admin')
+        # Prefect configuration
+        self.prefect_enabled = os.getenv('PREFECT_ENABLED', 'true').lower() == 'true'
+        self.prefect_api_url = os.getenv('PREFECT_API_URL', 'http://prefect-server:4200/api')
         
-        self.logger.info(f"Supervisor initialized - Airflow enabled: {self.airflow_enabled}")
-        self.logger.info(f"Airflow URL: {self.airflow_base_url}")
-    
+        self.logger.info(f"Supervisor initialized - Prefect enabled: {self.prefect_enabled}")
+        self.logger.info(f"Prefect API URL: {self.prefect_api_url}")
+
     def start_job(self, job_id: str, brief: dict):
         """Start a new podcast generation job"""
         self.logger.info(f"Starting job {job_id}")
         
+        # Ensure user_email is included in the brief
+        if 'user_email' not in brief:
+            brief['user_email'] = os.getenv('DEFAULT_APPROVAL_EMAIL')
+        
         # Update status
         self.update_job_status(job_id, JobStatus.OUTLINE_GENERATION.value)
         
-        # Send to outline generation (Kafka workflow)
+        # Update job with user email
+        self.repo.update_job(job_id, {"user_email": brief.get('user_email')})
+        
+        # Start Kafka workflow (immediate processing)
         kafka_success = self.send_to_next_stage(
             KafkaTopics.OUTLINE_GENERATION,
             {
@@ -41,79 +48,90 @@ class SupervisorAgent(BaseAgent):
             self.logger.error(f"Failed to send job {job_id} to Kafka")
             return {"error": "Failed to start Kafka workflow"}
         
-        # Try Airflow DAG trigger (optional)
-        if self.airflow_enabled:
-            airflow_result = self._trigger_airflow_dag(job_id, brief)
-            if airflow_result.get("success"):
-                self.logger.info(f"Airflow DAG triggered successfully for job {job_id}")
+        # Trigger Prefect flow (for monitoring and orchestration)
+        if self.prefect_enabled:
+            prefect_result = self._trigger_prefect_flow_sync(job_id, brief)
+            if prefect_result.get("success"):
+                self.logger.info(f"Prefect flow triggered successfully for job {job_id}")
             else:
-                self.logger.warning(f"Airflow trigger failed: {airflow_result.get('error')}")
+                self.logger.warning(f"Prefect trigger failed: {prefect_result.get('error')}")
+                # Continue with Kafka-only workflow if Prefect fails
         else:
-            self.logger.info("Airflow is disabled, using Kafka-only workflow")
+            self.logger.info("Prefect is disabled, using Kafka-only workflow")
         
         return {"success": True, "job_id": job_id}
-    
-    def _trigger_airflow_dag(self, job_id: str, brief: dict):
-        """Trigger Airflow DAG for the job"""
+
+    def _trigger_prefect_flow_sync(self, job_id: str, brief: dict):
+        """Trigger Prefect flow using HTTP API - CORRECTED VERSION"""
         try:
-            self.logger.info(f"Triggering Airflow DAG for job {job_id}")
+            self.logger.info(f"🔧 Attempting to trigger Prefect flow for job {job_id}")
             
-            # Create unique DAG run ID
-            dag_run_id = f"podcast_job_{job_id}_{int(time.time())}"
+            # First, get all deployments to find ours
+            deployments_url = f"{self.prefect_api_url}/deployments/"
             
-            # DAG configuration
-            dag_config = {
-                "job_id": job_id,
-                "brief": brief,
-                "triggered_at": datetime.now(timezone.utc).isoformat(),
-                "triggered_by": "supervisor_agent"
-            }
-            
-            # API request to trigger DAG
-            url = f"{self.airflow_base_url}/api/v1/dags/podcast_generation_pipeline/dagRuns"
-            
-            payload = {
-                "conf": dag_config,
-                "dag_run_id": dag_run_id
-            }
-            
-            headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json"
-            }
-            
-            # Use basic authentication
-            auth = (self.airflow_username, self.airflow_password)
-            
-            # Make the request
+            # Use POST with empty filter to get deployments (Prefect 2.x way)
             response = requests.post(
-                url,
-                json=payload,
-                headers=headers,
-                auth=auth,
-                timeout=30
+                deployments_url + "filter",
+                json={},
+                timeout=10,
+                headers={"Content-Type": "application/json"}
             )
             
-            if response.status_code == 200:
-                result = response.json()
-                self.logger.info(f"Successfully triggered Airflow DAG: {dag_run_id}")
-                return {"success": True, "dag_run_id": dag_run_id}
-            else:
-                error_msg = f"Airflow API error {response.status_code}: {response.text}"
-                self.logger.error(error_msg)
-                return {"success": False, "error": error_msg}
-                
-        except requests.exceptions.ConnectionError as e:
-            error_msg = f"Cannot connect to Airflow: {str(e)}"
-            self.logger.warning(error_msg)
-            return {"success": False, "error": error_msg}
+            if response.status_code != 200:
+                return {"success": False, "error": f"Failed to get deployments: {response.text}"}
             
+            deployments = response.json()
+            deployment_id = None
+            
+            self.logger.info(f"📋 Found {len(deployments)} deployments")
+            
+            # Find our deployment
+            for deployment in deployments:
+                if deployment.get("name") == "podcast-generation-deployment":
+                    deployment_id = deployment.get("id")
+                    self.logger.info(f"✅ Found deployment: {deployment_id}")
+                    break
+            
+            if not deployment_id:
+                available_deployments = [d.get("name") for d in deployments]
+                return {"success": False, "error": f"Deployment 'podcast-generation-deployment' not found. Available: {available_deployments}"}
+            
+            # Create flow run using the correct endpoint
+            flow_runs_url = f"{self.prefect_api_url}/deployments/{deployment_id}/create_flow_run"
+            payload = {
+                "parameters": {
+                    "job_id": job_id,
+                    "brief": brief,
+                    "user_email": brief.get('user_email', '')
+                },
+                "tags": [f"job-{job_id}", "podcast-generation"]
+            }
+            
+            self.logger.info(f"🚀 Creating flow run with payload: {json.dumps(payload, indent=2)}")
+            
+            response = requests.post(
+                flow_runs_url, 
+                json=payload, 
+                timeout=30,
+                headers={"Content-Type": "application/json"}
+            )
+            
+            if response.status_code in [200, 201]:
+                flow_run_data = response.json()
+                flow_run_id = flow_run_data.get("id")
+                self.logger.info(f"✅ Prefect flow triggered successfully: {flow_run_id}")
+                return {"success": True, "flow_run_id": flow_run_id}
+            else:
+                self.logger.error(f"❌ HTTP API trigger failed ({response.status_code}): {response.text}")
+                return {"success": False, "error": f"HTTP {response.status_code}: {response.text}"}
+                
         except Exception as e:
-            error_msg = f"Failed to trigger Airflow DAG: {str(e)}"
-            self.logger.warning(error_msg)
-            return {"success": False, "error": error_msg}
-    
+            self.logger.error(f"❌ Failed to trigger Prefect flow via HTTP: {str(e)}")
+            traceback.print_exc()
+            return {"success": False, "error": str(e)}
+
     def process(self, message: dict):
         """Process supervisor messages"""
         self.logger.info(f"Processing supervisor message: {message}")
         pass
+

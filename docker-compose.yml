@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   postgres:
     image: postgres:15
@@ -64,6 +62,66 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # Prefect Server
+  prefect-server:
+    image: prefecthq/prefect:2.14-python3.9
+    ports:
+      - "4200:4200"
+    environment:
+      - PREFECT_UI_URL=http://0.0.0.0:4200/api
+      - PREFECT_API_URL=http://0.0.0.0:4200/api
+      - PREFECT_SERVER_API_HOST=0.0.0.0
+      - PREFECT_API_DATABASE_CONNECTION_URL=postgresql+asyncpg://podcast_user:podcast_pass@postgres:5432/podcast_db
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: prefect server start --host 0.0.0.0
+    volumes:
+      - prefect_data:/opt/prefect
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM); sock.settimeout(5); result = sock.connect_ex(('localhost', 4200)); sock.close(); exit(0 if result == 0 else 1)"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    restart: unless-stopped
+
+  # Prefect Worker
+  prefect-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.prefect
+    env_file:
+      - .env
+    environment:
+      - PREFECT_API_URL=http://prefect-server:4200/api
+      - DATABASE_URL=postgresql://podcast_user:podcast_pass@postgres:5432/podcast_db
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - PYTHONPATH=/app
+    depends_on:
+      prefect-server:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./:/app
+    command: >
+      sh -c "
+        echo 'Waiting for Prefect server...' &&
+        sleep 30 &&
+        echo 'Starting Prefect worker first to create work pool...' &&
+        prefect worker start --pool 'default-agent-pool' --name 'podcast-worker' &
+        WORKER_PID=$$! &&
+        sleep 20 &&
+        echo 'Deploying Prefect flows...' &&
+        python scripts/deploy_prefect_simple.py &&
+        echo 'Waiting for worker...' &&
+        wait $$WORKER_PID
+      "
+    restart: unless-stopped
+
   api:
     build:
       context: .
@@ -79,11 +137,14 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      prefect-server:
+        condition: service_healthy
     restart: unless-stopped
     environment:
       - DATABASE_URL=postgresql://podcast_user:podcast_pass@postgres:5432/podcast_db
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - REDIS_URL=redis://redis:6379
+      - PREFECT_API_URL=http://prefect-server:4200/api
       - PYTHONPATH=/app
     volumes:
       - ./:/app
@@ -94,7 +155,7 @@ services:
       timeout: 10s
       retries: 3
 
-  # Worker Services
+  # Worker Services (Keep existing Kafka workers)
   outline-worker:
     build:
       context: .
@@ -335,58 +396,7 @@ services:
       - ./:/app
     command: python workers/publishing_worker.py
 
-  airflow-webserver:
-    build:
-      context: .
-      dockerfile: airflow.Dockerfile
-    depends_on:
-      postgres:
-        condition: service_healthy
-    env_file:
-      - .env
-    environment:
-      - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql+psycopg2://podcast_user:podcast_pass@postgres:5432/podcast_db
-      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - AIRFLOW__CORE__FERNET_KEY=3784nCSEB1oAJB-83dwDzz67Qi1Vo9MDhzrEBDzopBE=
-      - AIRFLOW__WEBSERVER__SECRET_KEY=RlUvZwONHluvcEel4pzZcrAwctPjpQpXkPjY0sMRfAU
-      - PYTHONPATH=/opt/airflow
-      - AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth
-      - AIRFLOW__WEBSERVER__AUTHENTICATE=False
-    ports:
-      - "8080:8080"
-    volumes:
-      - .:/opt/airflow
-      - ./orchestration/dags:/opt/airflow/dags
-      - airflow_logs:/opt/airflow/logs
-    command: webserver
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    restart: unless-stopped
-
-  airflow-scheduler:
-    build:
-      context: .
-      dockerfile: airflow.Dockerfile
-    depends_on:
-      - airflow-webserver
-    env_file:
-      - .env
-    environment:
-      - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql+psycopg2://podcast_user:podcast_pass@postgres:5432/podcast_db
-      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - AIRFLOW__CORE__FERNET_KEY=3784nCSEB1oAJB-83dwDzz67Qi1Vo9MDhzrEBDzopBE=
-      - PYTHONPATH=/opt/airflow
-    volumes:
-      - .:/opt/airflow
-      - ./orchestration/dags:/opt/airflow/dags
-      - airflow_logs:/opt/airflow/logs
-    command: scheduler
-    restart: unless-stopped
-
 volumes:
   postgres_data:
-  airflow_logs:
   api_logs:
+  prefect_data:
